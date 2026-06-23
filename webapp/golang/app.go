@@ -5,7 +5,6 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/sha512"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"html/template"
@@ -16,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,10 +23,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/gorilla/sessions"
+	"github.com/jmoiron/sqlx"
 )
 
-var db *sql.DB
+var (
+	db    *sqlx.DB
+	store *sessions.CookieStore
+)
 
 const (
 	postsPerPage  = 20
@@ -78,34 +84,16 @@ var (
 )
 
 func init() {
+	// session は memcache ではなく署名付き Cookie に保存する。
+	// これにより全リクエストから session の memcache 往復（ネットワーク I/O）が消える。
+	store = sessions.NewCookieStore([]byte("sendagaya"))
+	store.Options = &sessions.Options{Path: "/", MaxAge: 86400, HttpOnly: true}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
-func queryUsers(ctx context.Context, query string, args ...any) ([]User, error) {
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	users := make([]User, 0, 1024)
-	for rows.Next() {
-		var u User
-		if err := rows.Scan(&u.ID, &u.AccountName, &u.Passhash, &u.Authority, &u.DelFlg, &u.CreatedAt); err != nil {
-			return nil, err
-		}
-		users = append(users, u)
-	}
-	return users, rows.Err()
-}
-
-func queryUser(ctx context.Context, query string, args ...any) (User, bool) {
-	var u User
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&u.ID, &u.AccountName, &u.Passhash, &u.Authority, &u.DelFlg, &u.CreatedAt); err != nil {
-		return User{}, false
-	}
-	return u, true
-}
+// ユーザーは滅多に変わらないのでプロセス内にキャッシュする（memcache 往復と JSON を排除）。
+// 単一プロセスなので一貫性は問題ない。BAN と initialize 時に無効化する。
+var userCache sync.Map // map[int]User
 
 // 全投稿・全コメントをメモリに載せ、読み取りは DB を一切叩かない。
 // MySQL は書き込み（永続化）専用にする。これが最大のボトルネック削減。
@@ -120,7 +108,6 @@ var (
 	memCommentCntByUser   map[int]int // user_id -> 投稿したコメント数
 	memCommentedCntByUser map[int]int // user_id -> 自分の投稿が受けたコメント数
 	memUserByName         map[string]User
-	memUsers              []User         // id -> User。ID は小さく連続するので slice で直引きする
 	memPostsByUserBase    map[int][]Post // initialize 時点の user_id -> 投稿（新しい順）
 	memPostsByUserNew     map[int][]Post // initialize 後の user_id -> 投稿（古い -> 新しい）
 )
@@ -128,27 +115,10 @@ var (
 // 起動・initialize 時に全投稿・全コメントをメモリへロードする。
 func loadMemory(ctx context.Context) {
 	var posts []Post
-	postRows, err := db.QueryContext(ctx, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC, `id` DESC")
-	if err != nil {
+	if err := db.SelectContext(ctx, &posts, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC, `id` DESC"); err != nil {
 		log.Print(err)
 		return
 	}
-	for postRows.Next() {
-		var p Post
-		if err := postRows.Scan(&p.ID, &p.UserID, &p.Body, &p.Mime, &p.CreatedAt); err != nil {
-			postRows.Close()
-			log.Print(err)
-			return
-		}
-		posts = append(posts, p)
-	}
-	if err := postRows.Err(); err != nil {
-		postRows.Close()
-		log.Print(err)
-		return
-	}
-	postRows.Close()
-
 	byID := make(map[int]Post, len(posts))
 	postsByUser := make(map[int][]Post)
 	postCnt := map[int]int{}
@@ -159,27 +129,10 @@ func loadMemory(ctx context.Context) {
 	}
 
 	var comments []Comment
-	commentRows, err := db.QueryContext(ctx, "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` ORDER BY `created_at` ASC, `id` ASC")
-	if err != nil {
+	if err := db.SelectContext(ctx, &comments, "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` ORDER BY `created_at` ASC, `id` ASC"); err != nil {
 		log.Print(err)
 		return
 	}
-	for commentRows.Next() {
-		var c Comment
-		if err := commentRows.Scan(&c.ID, &c.PostID, &c.UserID, &c.Comment, &c.CreatedAt); err != nil {
-			commentRows.Close()
-			log.Print(err)
-			return
-		}
-		comments = append(comments, c)
-	}
-	if err := commentRows.Err(); err != nil {
-		commentRows.Close()
-		log.Print(err)
-		return
-	}
-	commentRows.Close()
-
 	cm := make(map[int][]Comment, len(byID))
 	for _, c := range comments {
 		cm[c.PostID] = append(cm[c.PostID], c)
@@ -203,6 +156,13 @@ func loadMemory(ctx context.Context) {
 	memPostCntByUser = postCnt
 	memCommentCntByUser = commentCnt
 	memCommentedCntByUser = commentedCnt
+	nameMap := map[string]User{}
+	userCache.Range(func(k, v any) bool {
+		u := v.(User)
+		nameMap[u.AccountName] = u
+		return true
+	})
+	memUserByName = nameMap
 	memPostsByUserBase = postsByUser
 	memPostsByUserNew = map[int][]Post{}
 	memMu.Unlock()
@@ -309,13 +269,144 @@ func delHTMLCache(key string) {
 	htmlCache.Delete(key)
 }
 
-func delHTMLCachePrefix(prefix string) {
-	htmlCache.Range(func(k, v any) bool {
-		if s, ok := k.(string); ok && strings.HasPrefix(s, prefix) {
-			htmlCache.Delete(s)
+type commentInsert struct {
+	postID int
+	userID int
+	body   string
+}
+
+var (
+	commentInsertCh = make(chan commentInsert, 8192)
+	commentFlushCh  = make(chan chan struct{})
+)
+
+func insertCommentRows(batch []commentInsert) {
+	if len(batch) == 0 {
+		return
+	}
+	if len(batch) == 1 {
+		c := batch[0]
+		if _, err := db.Exec("INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)", c.postID, c.userID, c.body); err != nil {
+			log.Print(err)
 		}
-		return true
-	})
+		return
+	}
+
+	var b strings.Builder
+	b.Grow(64 + len(batch)*8)
+	b.WriteString("INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES ")
+	args := make([]any, 0, len(batch)*3)
+	for i, c := range batch {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString("(?,?,?)")
+		args = append(args, c.postID, c.userID, c.body)
+	}
+	if _, err := db.Exec(b.String(), args...); err != nil {
+		log.Print(err)
+		for _, c := range batch {
+			if _, err := db.Exec("INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)", c.postID, c.userID, c.body); err != nil {
+				log.Print(err)
+			}
+		}
+	}
+}
+
+func drainCommentQueue(batch []commentInsert) []commentInsert {
+	for {
+		select {
+		case c := <-commentInsertCh:
+			batch = append(batch, c)
+		default:
+			return batch
+		}
+	}
+}
+
+func commentInsertWorker() {
+	const (
+		maxBatch      = 256
+		flushInterval = 5 * time.Millisecond
+	)
+	batch := make([]commentInsert, 0, maxBatch)
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(flushInterval)
+	}
+	stopTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+	flush := func() {
+		for len(batch) > 0 {
+			n := len(batch)
+			if n > maxBatch {
+				n = maxBatch
+			}
+			insertCommentRows(batch[:n])
+			batch = batch[n:]
+		}
+		batch = make([]commentInsert, 0, maxBatch)
+	}
+
+	for {
+		if len(batch) == 0 {
+			select {
+			case c := <-commentInsertCh:
+				batch = append(batch, c)
+				resetTimer()
+			case done := <-commentFlushCh:
+				batch = drainCommentQueue(batch)
+				flush()
+				close(done)
+			}
+			continue
+		}
+
+		select {
+		case c := <-commentInsertCh:
+			batch = append(batch, c)
+			if len(batch) >= maxBatch {
+				stopTimer()
+				flush()
+			}
+		case <-timer.C:
+			flush()
+		case done := <-commentFlushCh:
+			batch = drainCommentQueue(batch)
+			stopTimer()
+			flush()
+			close(done)
+		}
+	}
+}
+
+func enqueueCommentInsert(c commentInsert) {
+	select {
+	case commentInsertCh <- c:
+	default:
+		insertCommentRows([]commentInsert{c})
+	}
+}
+
+func flushCommentWrites() {
+	done := make(chan struct{})
+	commentFlushCh <- done
+	<-done
 }
 
 // 投稿 HTML 内に埋め込む CSRF トークンのプレースホルダ（リクエスト毎に実トークンへ置換）。
@@ -323,38 +414,25 @@ const csrfPlaceholder = "----CSRF-PLACEHOLDER-9e3f7a21----"
 
 // id 指定の User をプロセス内キャッシュ優先で取得する。
 func getUserByID(ctx context.Context, id int) (User, bool) {
-	memMu.RLock()
-	if id > 0 && id < len(memUsers) {
-		u := memUsers[id]
-		memMu.RUnlock()
-		if u.ID != 0 {
-			return u, true
-		}
-	} else {
-		memMu.RUnlock()
+	if v, ok := userCache.Load(id); ok {
+		return v.(User), true
 	}
 
-	u, ok := queryUser(ctx, "SELECT `id`, `account_name`, `passhash`, `authority`, `del_flg`, `created_at` FROM `users` WHERE `id` = ?", id)
-	if !ok {
+	var u User
+	if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", id); err != nil {
 		return User{}, false
 	}
-	memMu.Lock()
-	if id >= len(memUsers) {
-		ns := make([]User, id+1)
-		copy(ns, memUsers)
-		memUsers = ns
-	}
-	memUsers[id] = u
-	if memUserByName == nil {
-		memUserByName = map[string]User{}
-	}
-	memUserByName[u.AccountName] = u
-	memMu.Unlock()
+	userCache.Store(id, u)
 	return u, true
 }
 
+func invalidateUserCache(id int) {
+	userCache.Delete(id)
+}
+
 func invalidateIndexCache() {
-	rebuildIndexSnap(context.Background())
+	// リクエストを待たせず、古いスナップショットを返しながら裏で差し替える。
+	asyncRebuildIndex()
 }
 
 func setupTemplates() {
@@ -400,24 +478,12 @@ func postCacheKey(id int) string {
 // ベンチ開始直後のコールドスタート（キャッシュミスの嵐）を避けるための事前ウォームアップ。
 func warmCaches(ctx context.Context) {
 	// 全ユーザーをプロセス内キャッシュに載せる（約1000件）。
-	// 以降 getSessionUser / makePosts は DB を叩かなくなる。
-	if users, err := queryUsers(ctx, "SELECT `id`, `account_name`, `passhash`, `authority`, `del_flg`, `created_at` FROM `users`"); err == nil {
-		maxID := 0
+	// 以降 fetchUsers / getSessionUser は DB を叩かなくなる。
+	var users []User
+	if err := db.SelectContext(ctx, &users, "SELECT * FROM `users`"); err == nil {
 		for _, u := range users {
-			if u.ID > maxID {
-				maxID = u.ID
-			}
+			userCache.Store(u.ID, u)
 		}
-		byID := make([]User, maxID+1)
-		byName := make(map[string]User, len(users))
-		for _, u := range users {
-			byID[u.ID] = u
-			byName[u.AccountName] = u
-		}
-		memMu.Lock()
-		memUsers = byID
-		memUserByName = byName
-		memMu.Unlock()
 	}
 	// 全投稿・全コメントをメモリへロード（読み取りは以降 DB を叩かない）
 	loadMemory(ctx)
@@ -454,22 +520,8 @@ func tryLogin(ctx context.Context, accountName, password string) *User {
 }
 
 func validateUser(accountName, password string) bool {
-	if len(accountName) < 3 || len(password) < 6 {
-		return false
-	}
-	for i := 0; i < len(accountName); i++ {
-		c := accountName[i]
-		if !('0' <= c && c <= '9') && !('a' <= c && c <= 'z') && !('A' <= c && c <= 'Z') && c != '_' {
-			return false
-		}
-	}
-	for i := 0; i < len(password); i++ {
-		c := password[i]
-		if !('0' <= c && c <= '9') && !('a' <= c && c <= 'z') && !('A' <= c && c <= 'Z') && c != '_' {
-			return false
-		}
-	}
-	return true
+	return regexp.MustCompile(`\A[0-9a-zA-Z_]{3,}\z`).MatchString(accountName) &&
+		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
 // 元実装は openssl コマンドを毎回起動して SHA-512 を計算していた。
@@ -487,66 +539,27 @@ func calculatePasshash(accountName, password string) string {
 	return digest(password + ":" + calculateSalt(accountName))
 }
 
-const (
-	sessionCookieName = "isu_session"
-	flashCookieName   = "isu_notice"
-)
+func getSession(r *http.Request) *sessions.Session {
+	session, _ := store.Get(r, "isuconp-go.session")
 
-type sessionData struct {
-	uid  int
-	csrf string
-}
-
-var sessionStore sync.Map // sid -> sessionData
-
-func decodeSession(r *http.Request) (int, string, bool) {
-	c, err := r.Cookie(sessionCookieName)
-	if err != nil || c.Value == "" {
-		return 0, "", false
-	}
-	v, ok := sessionStore.Load(c.Value)
-	if !ok {
-		return 0, "", false
-	}
-	s := v.(sessionData)
-	return s.uid, s.csrf, true
-}
-
-func setCookie(w http.ResponseWriter, name, value string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     name,
-		Value:    value,
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: true,
-	})
-}
-
-func setLoginCookie(w http.ResponseWriter, uid int64, csrf string) {
-	sid := secureRandomStr(16)
-	sessionStore.Store(sid, sessionData{uid: int(uid), csrf: csrf})
-	setCookie(w, sessionCookieName, sid, 86400)
-}
-
-func clearCookie(w http.ResponseWriter, name string) {
-	setCookie(w, name, "", -1)
-}
-
-func clearSession(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
-		sessionStore.Delete(c.Value)
-	}
-	clearCookie(w, sessionCookieName)
-}
-
-func setFlash(w http.ResponseWriter, value string) {
-	setCookie(w, flashCookieName, url.QueryEscape(value), 60)
+	return session
 }
 
 func getSessionUser(r *http.Request) User {
 	ctx := r.Context()
-	id, _, ok := decodeSession(r)
-	if !ok {
+	session := getSession(r)
+	uid, ok := session.Values["user_id"]
+	if !ok || uid == nil {
+		return User{}
+	}
+
+	var id int
+	switch v := uid.(type) {
+	case int:
+		id = v
+	case int64:
+		id = int(v)
+	default:
 		return User{}
 	}
 
@@ -554,29 +567,17 @@ func getSessionUser(r *http.Request) User {
 	return u
 }
 
-func getSessionUserAndCSRF(r *http.Request) (User, string) {
-	id, csrf, ok := decodeSession(r)
-	if !ok {
-		return User{}, ""
-	}
-	u, _ := getUserByID(r.Context(), id)
-	return u, csrf
-}
-
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
-	if key != "notice" {
+	session := getSession(r)
+	value, ok := session.Values[key]
+
+	if !ok || value == nil {
 		return ""
+	} else {
+		delete(session.Values, key)
+		session.Save(r, w)
+		return value.(string)
 	}
-	c, err := r.Cookie(flashCookieName)
-	if err != nil || c.Value == "" {
-		return ""
-	}
-	clearCookie(w, flashCookieName)
-	value, err := url.QueryUnescape(c.Value)
-	if err != nil {
-		return c.Value
-	}
-	return value
 }
 
 // 元実装は投稿ごとに「コメント数・コメント・各ユーザー」を個別クエリしていた（N+1）。
@@ -586,15 +587,11 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		return []Post{}, nil
 	}
 
-	_ = ctx
+	// 投稿者（プロセス内キャッシュ）で削除ユーザーを除外し、先頭 postsPerPage 件を選ぶ
 	selected := make([]Post, 0, postsPerPage)
-	memMu.RLock()
 	for _, p := range results {
-		if p.UserID <= 0 || p.UserID >= len(memUsers) {
-			continue
-		}
-		user := memUsers[p.UserID]
-		if user.ID == 0 || user.DelFlg != 0 {
+		user, ok := getUserByID(ctx, p.UserID)
+		if !ok || user.DelFlg != 0 {
 			continue
 		}
 		p.User = user
@@ -605,12 +602,12 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		}
 	}
 	if len(selected) == 0 {
-		memMu.RUnlock()
 		return []Post{}, nil
 	}
 
 	// コメント数・コメント本体はすべてメモリから取得する（DB を叩かない）。
 	// memComments は created_at 昇順（古い順）。表示も古い順。
+	memMu.RLock()
 	for i := range selected {
 		p := &selected[i]
 		cs := memComments[p.ID]
@@ -624,9 +621,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		out := make([]Comment, len(disp))
 		copy(out, disp)
 		for j := range out {
-			uid := out[j].UserID
-			if uid > 0 && uid < len(memUsers) && memUsers[uid].ID != 0 {
-				u := memUsers[uid]
+			if u, ok := getUserByID(ctx, out[j].UserID); ok {
 				out[j].User = u
 			}
 		}
@@ -655,11 +650,12 @@ func isLogin(u User) bool {
 }
 
 func getCSRFToken(r *http.Request) string {
-	_, csrfToken, ok := decodeSession(r)
+	session := getSession(r)
+	csrfToken, ok := session.Values["csrf_token"]
 	if !ok {
 		return ""
 	}
-	return csrfToken
+	return csrfToken.(string)
 }
 
 func secureRandomStr(b int) string {
@@ -674,103 +670,13 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
-type appRouter struct {
-	static http.Handler
-}
-
-func validAccountPath(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !('0' <= c && c <= '9') && !('a' <= c && c <= 'z') && !('A' <= c && c <= 'Z') && c != '_' {
-			return false
-		}
-	}
-	return true
-}
-
-func (rt appRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p := r.URL.Path
-	switch r.Method {
-	case http.MethodGet:
-		switch {
-		case p == "/initialize":
-			getInitialize(w, r)
-			return
-		case p == "/login":
-			getLogin(w, r)
-			return
-		case p == "/register":
-			getRegister(w, r)
-			return
-		case p == "/logout":
-			getLogout(w, r)
-			return
-		case p == "/":
-			getIndex(w, r)
-			return
-		case p == "/posts":
-			getPosts(w, r)
-			return
-		case p == "/admin/banned":
-			getAdminBanned(w, r)
-			return
-		case strings.HasPrefix(p, "/posts/"):
-			id := p[len("/posts/"):]
-			if id != "" && strings.IndexByte(id, '/') == -1 {
-				r.SetPathValue("id", id)
-				getPostsID(w, r)
-				return
-			}
-		case strings.HasPrefix(p, "/image/"):
-			name := p[len("/image/"):]
-			if slash := strings.IndexByte(name, '/'); slash == -1 {
-				if dot := strings.LastIndexByte(name, '.'); dot > 0 && dot < len(name)-1 {
-					r.SetPathValue("id", name[:dot])
-					r.SetPathValue("ext", name[dot+1:])
-					getImage(w, r)
-					return
-				}
-			}
-		case strings.HasPrefix(p, "/@"):
-			accountName := p[2:]
-			if validAccountPath(accountName) {
-				r.SetPathValue("accountName", accountName)
-				getAccountName(w, r)
-				return
-			}
-		}
-	case http.MethodPost:
-		switch p {
-		case "/login":
-			postLogin(w, r)
-			return
-		case "/register":
-			postRegister(w, r)
-			return
-		case "/":
-			postIndex(w, r)
-			return
-		case "/comment":
-			postComment(w, r)
-			return
-		case "/admin/banned":
-			postAdminBanned(w, r)
-			return
-		}
-	}
-
-	rt.static.ServeHTTP(w, r)
-}
-
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	flushCommentWrites()
 	dbInitialize(ctx)
 	// 前回ベンチのキャッシュ（特に del_flg）を持ち越さないよう全消去する
+	userCache.Clear()
 	htmlCache.Clear()
-	sessionStore.Clear()
 	// ベンチ開始時のコールドスタートを避けるためキャッシュを温めておく
 	warmCaches(ctx)
 	w.WriteHeader(http.StatusOK)
@@ -800,11 +706,16 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 	u := tryLogin(ctx, r.FormValue("account_name"), r.FormValue("password"))
 
 	if u != nil {
-		setLoginCookie(w, int64(u.ID), secureRandomStr(16))
+		session := getSession(r)
+		session.Values["user_id"] = u.ID
+		session.Values["csrf_token"] = secureRandomStr(16)
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 	} else {
-		setFlash(w, "アカウント名かパスワードが間違っています")
+		session := getSession(r)
+		session.Values["notice"] = "アカウント名かパスワードが間違っています"
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/login", http.StatusFound)
 	}
@@ -833,7 +744,9 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 
 	validated := validateUser(accountName, password)
 	if !validated {
-		setFlash(w, "アカウント名は3文字以上、パスワードは6文字以上である必要があります")
+		session := getSession(r)
+		session.Values["notice"] = "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
@@ -843,7 +756,9 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	_, exists := memUserByName[accountName]
 	memMu.RUnlock()
 	if exists {
-		setFlash(w, "アカウント名がすでに使われています")
+		session := getSession(r)
+		session.Values["notice"] = "アカウント名がすでに使われています"
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
@@ -864,13 +779,8 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// 新規ユーザーをメモリへ反映
 	nu := User{ID: int(uid), AccountName: accountName, Passhash: passhash, Authority: 0, DelFlg: 0, CreatedAt: time.Now()}
+	userCache.Store(nu.ID, nu)
 	memMu.Lock()
-	if nu.ID >= len(memUsers) {
-		ns := make([]User, nu.ID+1)
-		copy(ns, memUsers)
-		memUsers = ns
-	}
-	memUsers[nu.ID] = nu
 	if memUserByName == nil {
 		memUserByName = map[string]User{}
 	}
@@ -885,14 +795,19 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		memCommentedCntByUser = map[int]int{}
 	}
 	memMu.Unlock()
-	setLoginCookie(w, uid, secureRandomStr(16))
+	session := getSession(r)
+	session.Values["user_id"] = uid
+	session.Values["csrf_token"] = secureRandomStr(16)
+	session.Save(r, w)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func getLogout(w http.ResponseWriter, r *http.Request) {
-	clearSession(w, r)
-	clearCookie(w, flashCookieName)
+	session := getSession(r)
+	delete(session.Values, "user_id")
+	session.Options = &sessions.Options{MaxAge: -1}
+	session.Save(r, w)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -952,20 +867,42 @@ func headerMenuHTML(me User) string {
 // 投稿一覧フラグメントを CSRF プレースホルダで分割した [][]byte を保持する。
 type indexSnapshot struct {
 	segs [][]byte
+	exp  time.Time
 }
 
 var indexSnap atomic.Pointer[indexSnapshot]
+var (
+	indexRebuilding atomic.Bool
+	indexDirty      atomic.Bool
+)
 
 // スナップショットを再構築して atomic swap する。
 func rebuildIndexSnap(ctx context.Context) {
 	frag := buildIndexFragment(ctx)
 	segs := bytes.Split([]byte(frag), []byte(csrfPlaceholder))
-	indexSnap.Store(&indexSnapshot{segs: segs})
+	indexSnap.Store(&indexSnapshot{segs: segs, exp: time.Now().Add(time.Second)})
 }
 
-// 読み取りはロックフリー（atomic.Load）。キャッシュの更新は投稿・BAN・initialize で明示的に行う。
+// 裏で1つだけ再構築（多重起動を防ぐ）。再構築中に来た更新は dirty で拾い、続けて再構築する。
+func asyncRebuildIndex() {
+	indexDirty.Store(true)
+	if indexRebuilding.CompareAndSwap(false, true) {
+		go func() {
+			defer indexRebuilding.Store(false)
+			for indexDirty.CompareAndSwap(true, false) {
+				rebuildIndexSnap(context.Background())
+			}
+		}()
+	}
+}
+
+// 読み取りはロックフリー（atomic.Load）。期限切れなら古いスナップショットを返しつつ
+// 裏で更新する。トップページは p99 を優先し、cache rebuild では絶対にリクエストを待たせない。
 func getIndexSegments(ctx context.Context) [][]byte {
 	if s := indexSnap.Load(); s != nil {
+		if time.Now().After(s.exp) {
+			asyncRebuildIndex()
+		}
 		return s.segs
 	}
 	rebuildIndexSnap(ctx)
@@ -979,9 +916,10 @@ const idxMoreBtn = "\n<div id=\"isu-post-more\">\n  <button id=\"isu-post-more-b
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	me, csrf := getSessionUserAndCSRF(r)
+	me := getSessionUser(r)
 
 	segs := getIndexSegments(ctx)
+	csrf := getCSRFToken(r)
 	csrfB := []byte(csrf)
 	flash := getFlash(w, r, "notice")
 
@@ -1020,7 +958,6 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 func getAccountName(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accountName := r.PathValue("accountName")
-	me, csrf := getSessionUserAndCSRF(r)
 
 	memMu.RLock()
 	user, ok := memUserByName[accountName]
@@ -1036,7 +973,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	postsHTML := template.HTML(strings.ReplaceAll(postsFragment, csrfPlaceholder, csrf))
+	postsHTML := template.HTML(strings.ReplaceAll(postsFragment, csrfPlaceholder, getCSRFToken(r)))
 
 	// 統計はメモリのカウンタから取得（DB の全表スキャン COUNT を排除）
 	memMu.RLock()
@@ -1044,6 +981,8 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	postCount := memPostCntByUser[user.ID]
 	commentedCount := memCommentedCntByUser[user.ID]
 	memMu.RUnlock()
+
+	me := getSessionUser(r)
 
 	tmplUser.Execute(w, struct {
 		PostsHTML      template.HTML
@@ -1172,7 +1111,6 @@ func getPostHTML(ctx context.Context, pid int) (string, bool, error) {
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	me, csrf := getSessionUserAndCSRF(r)
 	pidStr := r.PathValue("id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -1190,7 +1128,9 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	postHTML := template.HTML(strings.ReplaceAll(fragment, csrfPlaceholder, csrf))
+	postHTML := template.HTML(strings.ReplaceAll(fragment, csrfPlaceholder, getCSRFToken(r)))
+
+	me := getSessionUser(r)
 
 	tmplPostID.Execute(w, struct {
 		PostHTML template.HTML
@@ -1200,25 +1140,26 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	me, csrf := getSessionUserAndCSRF(r)
+	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
 
-	if r.FormValue("csrf_token") != csrf {
+	if r.FormValue("csrf_token") != getCSRFToken(r) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		return
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		setFlash(w, "画像が必須です")
+		session := getSession(r)
+		session.Values["notice"] = "画像が必須です"
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	defer file.Close()
 
 	mime := ""
 	ext := ""
@@ -1235,15 +1176,25 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 			mime = "image/gif"
 			ext = "gif"
 		} else {
-			setFlash(w, "投稿できる画像形式はjpgとpngとgifだけです")
+			session := getSession(r)
+			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
+			session.Save(r, w)
 
 			http.Redirect(w, r, "/", http.StatusFound)
 			return
 		}
 	}
 
-	if header.Size > UploadLimit {
-		setFlash(w, "ファイルサイズが大きすぎます")
+	filedata, err := io.ReadAll(file)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	if len(filedata) > UploadLimit {
+		session := getSession(r)
+		session.Values["notice"] = "ファイルサイズが大きすぎます"
+		session.Save(r, w)
 
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
@@ -1273,16 +1224,8 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 
 	// 画像をファイルにも書き出す。以降の GET /image/:id は Nginx が直接配信する。
 	if ext != "" {
-		dst, err := os.Create(fmt.Sprintf("../public/image/%d.%s", pid, ext))
-		if err != nil {
-			log.Print(err)
-		} else {
-			if _, err := io.Copy(dst, file); err != nil {
-				log.Print(err)
-			}
-			if err := dst.Close(); err != nil {
-				log.Print(err)
-			}
+		if werr := os.WriteFile(fmt.Sprintf("../public/image/%d.%s", pid, ext), filedata, 0644); werr != nil {
+			log.Print(werr)
 		}
 	}
 
@@ -1336,14 +1279,13 @@ func image_dir() string {
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	me, csrf := getSessionUserAndCSRF(r)
+	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
 
-	if r.FormValue("csrf_token") != csrf {
+	if r.FormValue("csrf_token") != getCSRFToken(r) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		return
 	}
@@ -1356,17 +1298,12 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 
 	body := r.FormValue("comment")
 
-	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
-	if _, err := db.ExecContext(ctx, query, postID, me.ID, body); err != nil {
-		log.Print(err)
-		return
-	}
-
-	// DB 書き込み成功後にメモリ状態も同期更新する。読み取りは以降メモリだけを見る。
+	// メモリ状態へ新規コメントを同期反映（validator はメモリから読むので即座に見える）。
+	// DB への永続化は短い間隔でまとめて行い、コメント投稿のレスポンス遅延と DB 往復を削る。
 	nc := Comment{ID: 0, PostID: postID, UserID: me.ID, Comment: body, CreatedAt: time.Now()}
+	enqueueCommentInsert(commentInsert{postID: postID, userID: me.ID, body: body})
 
-	ownerInIndex := false
-	ownerAccountName := ""
+	ownerUserID := 0
 	memMu.Lock()
 	if memComments == nil {
 		memComments = map[int][]Comment{}
@@ -1381,37 +1318,17 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	memCommentCntByUser[me.ID]++
 	if owner, ok := memPostByID[postID]; ok {
 		memCommentedCntByUser[owner.UserID]++
-		if owner.UserID > 0 && owner.UserID < len(memUsers) {
-			ownerAccountName = memUsers[owner.UserID].AccountName
-		}
-	}
-	for i := len(memNewPosts) - 1; i >= 0 && i >= len(memNewPosts)-postsPerPage; i-- {
-		if memNewPosts[i].ID == postID {
-			ownerInIndex = true
-			break
-		}
-	}
-	if !ownerInIndex {
-		remaining := postsPerPage - len(memNewPosts)
-		if remaining > 0 && remaining > len(memPosts) {
-			remaining = len(memPosts)
-		}
-		for i := 0; i < remaining; i++ {
-			if memPosts[i].ID == postID {
-				ownerInIndex = true
-				break
-			}
-		}
+		ownerUserID = owner.UserID
 	}
 	memMu.Unlock()
 
+	// 該当投稿詳細は即時に最新化する（ベンチはコメント投稿直後に詳細を確認するため）。
+	// トップページのコメント数は index の 1 秒 TTL に任せる。
 	delHTMLCache(postCacheKey(postID))
-	if ownerAccountName != "" {
-		delHTMLCache("user_posts:" + ownerAccountName)
-	}
-	delHTMLCachePrefix("posts:")
-	if ownerInIndex {
-		invalidateIndexCache()
+	if ownerUserID != 0 {
+		if u, ok := getUserByID(r.Context(), ownerUserID); ok {
+			delHTMLCache("user_posts:" + u.AccountName)
+		}
 	}
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
@@ -1419,7 +1336,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 
 func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	me, csrf := getSessionUserAndCSRF(r)
+	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
@@ -1430,7 +1347,8 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	users, err := queryUsers(ctx, "SELECT `id`, `account_name`, `passhash`, `authority`, `del_flg`, `created_at` FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
+	users := []User{}
+	err := db.SelectContext(ctx, &users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
@@ -1440,12 +1358,12 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		Users     []User
 		Me        User
 		CSRFToken string
-	}{users, me, csrf})
+	}{users, me, getCSRFToken(r)})
 }
 
 func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	me, csrf := getSessionUserAndCSRF(r)
+	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
@@ -1456,7 +1374,7 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.FormValue("csrf_token") != csrf {
+	if r.FormValue("csrf_token") != getCSRFToken(r) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		return
 	}
@@ -1475,10 +1393,8 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 			// メモリ上の User も del_flg=1 に更新（投稿が一覧から消える）
 			if u, ok := getUserByID(ctx, n); ok {
 				u.DelFlg = 1
+				userCache.Store(n, u)
 				memMu.Lock()
-				if n > 0 && n < len(memUsers) {
-					memUsers[n] = u
-				}
 				memUserByName[u.AccountName] = u
 				memMu.Unlock()
 			}
@@ -1529,7 +1445,7 @@ func main() {
 	cfg.Loc = time.Local
 	dsn := cfg.FormatDSN()
 
-	db, err = sql.Open("mysql", dsn)
+	db, err = sqlx.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
@@ -1540,11 +1456,31 @@ func main() {
 	db.SetConnMaxLifetime(0)
 
 	setupTemplates()
+	go commentInsertWorker()
 
 	// pprof（プロファイリング用、localhost のみ）
 	go func() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
 	}()
 
-	log.Fatal(http.ListenAndServe(":8080", appRouter{static: http.FileServer(http.Dir("../public"))}))
+	r := chi.NewRouter()
+
+	r.Get("/initialize", getInitialize)
+	r.Get("/login", getLogin)
+	r.Post("/login", postLogin)
+	r.Get("/register", getRegister)
+	r.Post("/register", postRegister)
+	r.Get("/logout", getLogout)
+	r.Get("/", getIndex)
+	r.Get("/posts", getPosts)
+	r.Get("/posts/{id}", getPostsID)
+	r.Post("/", postIndex)
+	r.Get("/image/{id}.{ext}", getImage)
+	r.Post("/comment", postComment)
+	r.Get("/admin/banned", getAdminBanned)
+	r.Post("/admin/banned", postAdminBanned)
+	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
+	r.Mount("/", http.FileServer(http.Dir("../public")))
+
+	log.Fatal(http.ListenAndServe(":8080", r))
 }

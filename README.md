@@ -26,12 +26,12 @@ RETROSPECTIVE.md             # full write-up: what we did, problems, mistakes
 
 ## Architecture summary
 
-The winning architecture is an **in-memory state machine**:
+The final architecture is an **in-memory state machine**:
 
-- At `/initialize` (and startup) **all posts, comments and users are loaded into process memory**. Read requests never touch MySQL.
+- At `/initialize`, **all posts, comments and users are loaded into process memory**. Read requests never touch MySQL.
 - **MySQL is write/persistence only.** Writes update memory synchronously (so the validator sees them immediately) and persist to MySQL asynchronously where safe.
 - Per-user read models (post lists, comment counts, "commented" counts) are maintained **incrementally on write** — no request-time `JOIN` / `COUNT` / sort.
-- Hot pages are cached as **pre-rendered `[]byte`** with a CSRF placeholder; the request path is essentially `atomic.Load` + `write([]byte)` (no template execution, no lock).
+- The top page keeps an atomic snapshot of pre-rendered post-list bytes with a CSRF placeholder; user/post/pagination fragments are also cached with CSRF placeholders to reduce template work.
 - Sessions live in a **signed cookie** (no session store round-trip).
 - nginx serves all static files and posted images directly from disk; the app only handles dynamic routes.
 
