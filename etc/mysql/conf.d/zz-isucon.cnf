@@ -1,0 +1,12 @@
+[mysqld]
+# ISUCON tuning. 内存状態機により DB は永続化専用なので、書き込みを最大限高速化する。
+innodb_buffer_pool_size        = 1G
+innodb_log_buffer_size         = 256M
+innodb_flush_log_at_trx_commit = 0
+innodb_flush_method            = O_DIRECT
+innodb_doublewrite             = 0
+sync_binlog                    = 0
+skip-log-bin
+max_connections                = 512
+thread_cache_size              = 128
+table_open_cache               = 4096
